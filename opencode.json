@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "minebot": {
+      "type": "local",
+      "command": ["python", "-u", "D:\\minebot\\mcp_server.py"],
+      "enabled": true
+    }
+  }
+}

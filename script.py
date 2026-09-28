@@ -5,11 +5,12 @@ class ScriptError(Exception):
 BLOCKING = {
     "move", "look", "jump", "rclick", "lclick", "swing",
     "sneak", "sprint", "drop", "mine", "goto", "stop",
-    "gather", "craft", "chunkmine",
+    "gather", "craft", "chunkmine", "near", "silent", "defy", "beat",
+    "inv",
 }
 NON_BLOCKING = {"chat", "follow", "wander", "tpa", "tpaccept"}
 
-TIMEOUTS = {"chunkmine": 3600.0, "gather": 300.0, "craft": 90.0}
+TIMEOUTS = {"chunkmine": 3600.0, "gather": 300.0, "craft": 90.0, "mine": 300.0}
 
 PREP_STEPS = [
     ("gather", {"what": "wood", "count": 10}),
@@ -55,19 +56,57 @@ def _parse_action(kind, rest, where):
                 raise ScriptError(f"{where}: {kind} on|off")
             on = rest[0].lower() == "on"
         return {"on": on}
-    if kind in ("rclick", "lclick", "jump", "swing", "drop", "stop"):
+    if kind in ("rclick", "lclick"):
+        if len(rest) > 1:
+            raise ScriptError(f"{where}: {kind} [player]")
+        return {"player": rest[0]} if rest else {}
+    if kind in ("jump", "swing", "drop", "stop", "inv"):
         return {}
+    if kind == "near":
+        r = _num(rest[0], "view radius", where) if rest else 48.0
+        if r < 4 or r > 128:
+            raise ScriptError(f"{where}: view radius must be 4-128")
+        return {"radius": r}
+    if kind == "silent":
+        s = _num(rest[0], "seconds", where) if rest else 15.0
+        if s < 0 or s > 300:
+            raise ScriptError(f"{where}: silent seconds must be 0-300")
+        return {"s": s}
+    if kind == "defy":
+        s = _num(rest[0], "seconds", where) if rest else 30.0
+        if s < 0 or s > 300:
+            raise ScriptError(f"{where}: defy seconds must be 0-300")
+        return {"s": s}
+    if kind == "beat":
+        s = _num(rest[0], "seconds", where) if rest else 60.0
+        if s < 0 or s > 300:
+            raise ScriptError(f"{where}: beat seconds must be 0-300")
+        return {"s": s}
     if kind == "chat":
         text = " ".join(rest)
         if not text:
             raise ScriptError(f"{where}: say <text>")
         return {"text": text}
+    if kind == "cmd":
+        text = " ".join(rest)
+        if not text:
+            raise ScriptError(f"{where}: cmd <command>  (e.g. cmd /home)")
+        if not text.startswith("/"):
+            text = "/" + text
+        return {"text": text}
     if kind == "goto":
         if len(rest) == 3:
+            def _axis(tok, what):
+                # minecraft-style ~ / ~2 = bot-relative, resolved in taskGoto
+                if tok.startswith("~"):
+                    if tok != "~":
+                        _num(tok[1:], what + " offset", where)
+                    return tok
+                return _num(tok, what, where)
             return {
-                "x": _num(rest[0], "x", where),
-                "y": _num(rest[1], "y", where),
-                "z": _num(rest[2], "z", where),
+                "x": _axis(rest[0], "x"),
+                "y": _axis(rest[1], "y"),
+                "z": _axis(rest[2], "z"),
             }
         if len(rest) == 1:
             return {"player": rest[0]}
@@ -171,6 +210,11 @@ def parse(text, roster_len):
         rest = parts[1:] if sel_seen else parts
         if not rest:
             raise ScriptError(f"{where}: selector with no action")
+        if rest[0].startswith("/"):
+            # bare /command statement -> chat packet on the wire
+            steps.append({"sel": target, "kind": "chat",
+                          "args": {"text": " ".join(rest)}})
+            continue
         kind = rest[0].lower()
         kind = ALIASES.get(kind, kind)
 
@@ -187,6 +231,8 @@ def parse(text, roster_len):
             continue
 
         args = _parse_action(kind, rest[1:], where)
+        if kind == "cmd":
+            kind = "chat"
         if kind in BLOCKING or kind in NON_BLOCKING:
             steps.append({"sel": target, "kind": kind, "args": args})
         else:
@@ -197,8 +243,10 @@ def parse(text, roster_len):
 
 
 HELP = (
-    "sel: all|sel|#0,2 | name:Bob  ;  act: move fwd 3 | look 90 -10 | rclick | "
-    "lclick | jump | sneak on | drop | say hi | wait 2 | goto 10 64 10 | "
+    "sel: all|sel|#0,2 | name:Bob  ;  act: move fwd 3 | look 90 -10 | rclick [Bob] | "
+    "lclick [Bob] | near [48] | silent [15] | defy [30] | beat [60] | jump | sneak on | drop | say hi | wait 2 | "
+    "goto 10 64 10 (or ~ ~2 ~5 relative) | "
     "follow Bob | wander 24 | mine 3 1 | stop | tpa Bob | tpaccept | "
-    "gather wood 10 | craft woodpick | prep | chunkmine 100 -300 16   (sep: ;)"
+    "gather wood 10 | craft woodpick | prep | chunkmine 100 -300 16 | "
+    "cmd /home  (or bare /home)   (sep: ;)"
 )

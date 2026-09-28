@@ -19,13 +19,24 @@ class BotProc:
         self.state = "offline"
         self.task_state = "-"
         self.detail = ""
+        self._connect_ts = 0.0
         self._read_task = None
         self._err_task = None
 
     async def start(self, server):
         if self.proc and self.proc.returncode is None:
-            return
+            if self.state in ("online", "idle"):
+                return
+            if self.state in ("spawning", "connecting"):
+                if time.time() - self._connect_ts < 20:
+                    return
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            self.proc = None
         self.state = "spawning"
+        self._connect_ts = time.time()
         self.proc = await asyncio.create_subprocess_exec(
             "node", NODE,
             stdin=asyncio.subprocess.PIPE,
@@ -99,17 +110,24 @@ class BotProc:
             return False
 
     async def stop(self):
-        if self.proc and self.proc.returncode is None:
-            self.send({"cmd": "leave"})
-            try:
-                await asyncio.wait_for(self.proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
+        p = self.proc
+        try:
+            if p and p.returncode is None:
+                self.send({"cmd": "leave"})
                 try:
-                    self.proc.kill()
+                    await asyncio.wait_for(p.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            if p and p.returncode is None:
+                try:
+                    p.kill()
                 except Exception:
                     pass
-        self.state = "offline"
-        self.task_state = "-"
+            if self.proc is p:
+                self.proc = None
+            self.state = "offline"
+            self.task_state = "-"
 
 
 class Engine:
@@ -120,6 +138,7 @@ class Engine:
         self.on_event = on_event or (lambda u, m: None)
         self.logs = []
         self._task_waiters = {}
+        self.chat_filter = True  # True = chat hidden from console
 
     def status_of(self, uuid):
         p = self.procs.get(uuid)
@@ -146,6 +165,7 @@ class Engine:
         if msg.get("evt") == "task" and msg.get("state") in ("done", "failed"):
             w = self._task_waiters.get(msg.get("id"))
             if w:
+                w.setdefault("outcomes", {})[uuid] = (msg.get("state"), msg.get("detail") or "")
                 w["pending"].discard(uuid)
                 if not w["pending"]:
                     w["event"].set()
@@ -165,8 +185,10 @@ class Engine:
     async def join_all(self, delay=None):
         delay = self.config.join_delay if delay is None else delay
         tasks = []
+        skipped = 0
         for b in self.store.bots:
             if b.get("status") == "expired":
+                skipped += 1
                 continue
             p = self.procs.get(b["uuid"])
             if not p:
@@ -177,6 +199,11 @@ class Engine:
             if i:
                 await asyncio.sleep(delay)
             await p.start(self.config.server)
+            p.send({"cmd": "filter", "on": self.chat_filter})
+        msg = f"join: {len(tasks)} bot(s) -> {self.config.server}"
+        if skipped:
+            msg += f" ({skipped} expired token skipped - re-add bot)"
+        return msg
 
     async def join_one(self, uuid):
         b = self._entry(uuid)
@@ -187,11 +214,14 @@ class Engine:
             p = BotProc(b, self._event)
             self.procs[uuid] = p
         await p.start(self.config.server)
+        p.send({"cmd": "filter", "on": self.chat_filter})
         return True
 
     async def leave_all(self):
+        n = sum(1 for p in self.procs.values() if p.proc)
         for p in list(self.procs.values()):
             await p.stop()
+        return f"leave: {n} bot(s) stopped"
 
     async def leave_one(self, uuid):
         p = self.procs.get(uuid)
@@ -199,12 +229,20 @@ class Engine:
             await p.stop()
 
     async def rejoin_dead(self):
+        joined = 0
+        skipped = 0
         for b in self.store.bots:
             if b.get("status") == "expired":
+                skipped += 1
                 continue
             st = self.status_of(b["uuid"])
             if st in ("offline", "kicked", "error", "idle", "ready"):
                 await self.join_one(b["uuid"])
+                joined += 1
+        msg = f"rejoin: {joined} bot(s) restarted"
+        if skipped:
+            msg += f" ({skipped} expired token skipped - re-add bot)"
+        return msg
 
     def _targets(self, target):
         if target == "ALL":
@@ -218,6 +256,14 @@ class Engine:
             if p.send({"cmd": "chat", "text": text}):
                 sent += 1
         return sent
+
+    def set_chat_filter(self, hide):
+        self.chat_filter = bool(hide)
+        n = 0
+        for p in self.procs.values():
+            if p.send({"cmd": "filter", "on": self.chat_filter}):
+                n += 1
+        return n
 
     def broadcast_task(self, kind, args, target="ALL", sync=True):
         tid = uuidlib.uuid4().hex[:8]
@@ -341,12 +387,26 @@ class Engine:
                     on_progress(i, total, f"sent to {len(pending)}")
                 continue
             ev = asyncio.Event()
-            self._task_waiters[tid] = {"pending": pending, "event": ev}
+            self._task_waiters[tid] = {"pending": pending, "event": ev, "outcomes": {}}
             sent_count = len(pending)
             timeout = max(step_timeout, TIMEOUTS.get(kind, 0.0))
             try:
                 await asyncio.wait_for(ev.wait(), timeout=timeout)
-                results.append(f"{i}/{total} {kind} done x{sent_count}")
+                outs = self._task_waiters.get(tid, {}).get("outcomes", {})
+                fails = [d for _, (st, d) in outs.items() if st == "failed"]
+                if fails:
+                    uniq = []
+                    for d in fails:
+                        if d not in uniq:
+                            uniq.append(d)
+                    why = "; ".join(uniq)
+                    ok = sent_count - len(fails)
+                    if ok <= 0:
+                        results.append(f"{i}/{total} {kind} FAILED: {why}")
+                    else:
+                        results.append(f"{i}/{total} {kind} done x{ok} ({len(fails)} failed: {why})")
+                else:
+                    results.append(f"{i}/{total} {kind} done x{sent_count}")
             except asyncio.TimeoutError:
                 results.append(f"{i}/{total} {kind} TIMEOUT after {timeout:g}s")
             finally:
